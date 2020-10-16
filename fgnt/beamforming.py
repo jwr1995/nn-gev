@@ -1,4 +1,6 @@
 import numpy as np
+from multiprocessing import Pool, cpu_count
+from functools import partial
 from numpy.linalg import solve
 from scipy.linalg import eig
 from scipy.linalg import eigh
@@ -62,7 +64,7 @@ def get_pca_vector(target_psd_matrix):
     return beamforming_vector
 
 
-def get_mvdr_vector(atf_vector, noise_psd_matrix):
+def get_mvdr_vector(noise_psd_matrix, target_psd_matrix=None, atf_vector=None):
     """
     Returns the MVDR beamforming vector.
 
@@ -72,7 +74,7 @@ def get_mvdr_vector(atf_vector, noise_psd_matrix):
         with shape (bins, sensors, sensors)
     :return: Set of beamforming vectors with shape (..., bins, sensors)
     """
-
+    if atf_vector == None:  atf_vector = get_pca_vector(target_psd_matrix)
     while atf_vector.ndim > noise_psd_matrix.ndim - 1:
         noise_psd_matrix = np.expand_dims(noise_psd_matrix, axis=0)
 
@@ -127,14 +129,14 @@ def blind_analytic_normalization_legacy(vector, noise_psd_matrix):
 
 def blind_analytic_normalization(vector, noise_psd_matrix, eps=0):
     """Reduces distortions in beamformed ouptput.
-        
+
     :param vector: Beamforming vector
         with shape (..., sensors)
     :param noise_psd_matrix:
         with shape (..., sensors, sensors)
     :return: Scaled Deamforming vector
         with shape (..., sensors)
-    
+
     >>> vector = np.random.normal(size=(5, 6)).view(np.complex128)
     >>> vector.shape
     (5, 3)
@@ -145,7 +147,7 @@ def blind_analytic_normalization(vector, noise_psd_matrix, eps=0):
     >>> w1 = blind_analytic_normalization_legacy(vector, noise_psd_matrix)
     >>> w2 = blind_analytic_normalization(vector, noise_psd_matrix)
     >>> np.testing.assert_allclose(w1, w2)
-        
+
     """
     nominator = np.einsum(
         '...a,...ab,...bc,...c->...',
@@ -179,9 +181,31 @@ def phase_correction(vector):
             np.sum(w[f, :] * w[f-1, :].conj(), axis=-1, keepdims=True)))
     return w
 
+def beamform(beamformer,mix=None,target_psd_matrix=None,noise_psd_matrix=None,atf_vector=None, org_dtype=np.complex128,normalization=False):
+    """
+    We use a function instead of a for loop so that we can use
+    multiprocessing
+    """
+    if beamformer=='gev':
+        W_gev = get_gev_vector(target_psd_matrix, noise_psd_matrix)
+        W_bf = phase_correction(W_gev)
 
-def gev_wrapper_on_masks(mix, noise_mask=None, target_mask=None,
-                         normalization=False):
+        if normalization:
+            W_bf = blind_analytic_normalization(W_bf, noise_psd_matrix)
+    elif beamformer=='mvdr':
+        W_bf = get_mvdr_vector(noise_psd_matrix, target_psd_matrix=target_psd_matrix, atf_vector=atf_vector)
+
+    output = apply_beamforming_vector(W_bf, mix)
+    output = output.astype(org_dtype)
+
+    return {beamformer : output.T}
+
+def bf_wrapper_on_masks(mix, noise_mask=None, target_mask=None,
+                         normalization=False,beamformers=['gev','mvdr']):
+    """
+    Arguments:
+        mix =
+    """
     if noise_mask is None and target_mask is None:
         raise ValueError('At least one mask needs to be present.')
 
@@ -200,13 +224,9 @@ def gev_wrapper_on_masks(mix, noise_mask=None, target_mask=None,
     noise_psd_matrix = condition_covariance(noise_psd_matrix, 1e-6)
     noise_psd_matrix /= np.trace(
         noise_psd_matrix, axis1=-2, axis2=-1)[..., None, None]
-    W_gev = get_gev_vector(target_psd_matrix, noise_psd_matrix)
-    W_gev = phase_correction(W_gev)
 
-    if normalization:
-        W_gev = blind_analytic_normalization(W_gev, noise_psd_matrix)
+    with Pool(processes=min(len(beamformers),cpu_count()-1)) as p:
+        output_list = p.map(partial(beamform,mix=mix,normalization=normalization,target_psd_matrix=target_psd_matrix,noise_psd_matrix=noise_psd_matrix,org_dtype=org_dtype), beamformers)
 
-    output = apply_beamforming_vector(W_gev, mix)
-    output = output.astype(org_dtype)
+    return {k : v for d in output_list for k, v in d.items()}
 
-    return output.T

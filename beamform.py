@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from chime_data import gen_flist_simu, \
     gen_flist_real, get_audio_data, get_audio_data_with_context
-from fgnt.beamforming import gev_wrapper_on_masks
+from fgnt.beamforming import bf_wrapper_on_masks
 from fgnt.signal_processing import audiowrite, stft, istft
 from fgnt.utils import Timer
 from fgnt.utils import mkdir_p
@@ -28,8 +28,11 @@ parser.add_argument('model',
                     help='Trained model file')
 parser.add_argument('model_type',
                     help='Type of model (BLSTM or FW)')
+parser.add_argument('beamformer',
+                    help='Type of beamformer (GEV, MVDR of ALL)')
 parser.add_argument('--gpu', '-g', default=-1, type=int,
                     help='GPU ID (negative value indicates CPU)')
+
 args = parser.parse_args()
 
 # Prepare model
@@ -39,6 +42,15 @@ elif args.model_type == 'FW':
     model = SimpleFWMaskEstimator()
 else:
     raise ValueError('Unknown model type. Possible are "BLSTM" and "FW"')
+
+if args.beamformer == 'GEV':
+    beamformers=['gev']
+elif args.beamformer == 'MVDR':
+    beamformers=['mvdr']
+elif args.beamformer == 'ALL':
+    beamformers=['gev','mvdr']
+
+print("Selected beamformers:",' '.join(beamformers).upper())
 
 serializers.load_hdf5(args.model, model)
 if args.gpu >= 0:
@@ -59,9 +71,10 @@ else:
     raise ValueError('Unknown flist {}'.format(args.flist))
 
 for env in ['caf', 'bus', 'str', 'ped']:
-    mkdir_p(os.path.join(args.output_dir, '{}05_{}_{}'.format(
-            stage, env, scenario
-    )))
+    for beamformer in beamformers:
+        mkdir_p(os.path.join(args.output_dir, beamformer,'{}05_{}_{}'.format(
+                stage, env, scenario
+        )))
 
 t_io = 0
 t_net = 0
@@ -89,7 +102,7 @@ for cur_line in tqdm(flist):
     with Timer() as t:
         N_mask = np.median(N_masks.data, axis=1)
         X_mask = np.median(X_masks.data, axis=1)
-        Y_hat = gev_wrapper_on_masks(Y, N_mask, X_mask)
+        Y_hat_dicts = bf_wrapper_on_masks(Y, N_mask, X_mask, beamformers=beamformers)
     t_beamform += t.msecs
 
     if scenario == 'simu':
@@ -101,14 +114,15 @@ for cur_line in tqdm(flist):
         spk = cur_line[0].split('/')[-1].split('_')[0]
         env = cur_line[0].split('/')[-1].split('_')[-1]
 
-    filename = os.path.join(
-            args.output_dir,
-            '{}05_{}_{}'.format(stage, env.lower(), scenario),
-            '{}_{}_{}.wav'.format(spk, wsj_name, env.upper())
-    )
-    with Timer() as t:
-        audiowrite(istft(Y_hat)[context_samples:], filename, 16000, True, True)
-    t_io += t.msecs
+    for beamformer, Y_hat in Y_hat_dicts.items():
+        filename = os.path.join(
+                args.output_dir,beamformer,
+                '{}05_{}_{}'.format(stage, env.lower(), scenario),
+                '{}_{}_{}.wav'.format(spk, wsj_name, env.upper())
+        )
+        with Timer() as t:
+            audiowrite(istft(Y_hat)[context_samples:], filename, 16000, True, True)
+        t_io += t.msecs
 
 print('Finished')
 print('Timings: I/O: {:.2f}s | Net: {:.2f}s | Beamformer: {:.2f}s'.format(
